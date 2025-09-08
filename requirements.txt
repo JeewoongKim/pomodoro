@@ -1,0 +1,5 @@
+PyQt6>=6.4.0
+PyQt6-SVG>=6.4.0
+pyqtgraph>=0.13.0
+pyinstaller>=5.8.0
+plyer>=2.1.0
