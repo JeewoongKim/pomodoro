@@ -90,7 +90,8 @@ class FloatingWidget(QWidget):
     """Floating widget for always-on-top timer display"""
     
     clicked = Signal()
-    toggle_timer = Signal()  # New signal for toggle timer
+    toggle_timer = Signal()
+    skip_break = Signal()  # New signal for skipping break
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -105,7 +106,8 @@ class FloatingWidget(QWidget):
         self.resizing = False
         self.resize_start_pos = QPoint()
         self.resize_start_size = QSize()
-        self.is_running = False  # Track running state
+        self.is_running = False
+        self.is_working = True  # Track work/break state
         self.hover_opacity = 0.9
         self.normal_opacity = 0.7
         
@@ -125,10 +127,14 @@ class FloatingWidget(QWidget):
         self.is_running = is_running
         self.update()
         
+    def setWorkingState(self, is_working):
+        """Update the working/break state of the widget"""
+        self.is_working = is_working
+        self.update()
+        
     def enterEvent(self, event):
         """Mouse enters widget area - show hover effect"""
         self.setWindowOpacity(self.hover_opacity)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
         super().enterEvent(event)
         
     def leaveEvent(self, event):
@@ -136,6 +142,32 @@ class FloatingWidget(QWidget):
         self.setWindowOpacity(self.normal_opacity)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         super().leaveEvent(event)
+        
+    def mouseMoveEvent(self, event):
+        # Check if near resize corner to change cursor
+        edge_threshold = 15
+        near_corner = (self.width() - event.position().x() < edge_threshold and 
+                      self.height() - event.position().y() < edge_threshold)
+        
+        if near_corner and not self.resizing:
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)  # Diagonal resize cursor
+        elif not self.resizing and not self.dragging:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            
+        if event.buttons() == Qt.MouseButton.LeftButton:
+            if self.resizing:
+                self.has_moved = True
+                delta = event.globalPosition().toPoint() - self.resize_start_pos
+                new_width = max(100, self.resize_start_size.width() + delta.x())
+                new_height = max(100, self.resize_start_size.height() + delta.y())
+                self.resize(new_width, new_height)
+            elif self.dragging:
+                # Check if mouse moved significantly (more than 3 pixels)
+                if hasattr(self, 'click_pos'):
+                    move_distance = (event.position().toPoint() - self.click_pos).manhattanLength()
+                    if move_distance > 3:
+                        self.has_moved = True
+                        self.move(event.globalPosition().toPoint() - self.drag_position)
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -164,6 +196,28 @@ class FloatingWidget(QWidget):
             triangle.closeSubpath()
             painter.drawPath(triangle)
         
+        # Draw skip button during break time in top-right corner
+        if not self.is_working and self.width() > 80:
+            skip_size = 16
+            skip_rect = QRect(self.width() - skip_size - 5, 5, skip_size, skip_size)
+            painter.setBrush(QColor(255, 140, 0, 150))  # Orange color
+            painter.setPen(Qt.PenStyle.NoPen)
+            
+            # Draw skip icon (double arrow >>)
+            arrow_path = QPainterPath()
+            # First arrow
+            arrow_path.moveTo(self.width() - 18, 7)
+            arrow_path.lineTo(self.width() - 18, 19)
+            arrow_path.lineTo(self.width() - 12, 13)
+            arrow_path.closeSubpath()
+            # Second arrow
+            arrow_path.moveTo(self.width() - 12, 7)
+            arrow_path.lineTo(self.width() - 12, 19)
+            arrow_path.lineTo(self.width() - 6, 13)
+            arrow_path.closeSubpath()
+            
+            painter.drawPath(arrow_path)
+        
         # Draw resize corner indicator
         corner_size = 12
         corner_rect = QRect(self.width() - corner_size, self.height() - corner_size, 
@@ -173,7 +227,15 @@ class FloatingWidget(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.click_pos = event.position().toPoint()
-            self.has_moved = False  # Track if mouse has actually moved
+            self.has_moved = False
+            
+            # Check for skip button click (only during break)
+            if not self.is_working and self.width() > 80:
+                skip_area = QRect(self.width() - 21, 5, 16, 16)
+                if skip_area.contains(event.position().toPoint()):
+                    self.skip_break.emit()
+                    return
+            
             # Check if near edge for resizing
             edge_threshold = 15
             if (self.width() - event.position().x() < edge_threshold and 
@@ -182,36 +244,22 @@ class FloatingWidget(QWidget):
                 self.resize_start_pos = event.globalPosition().toPoint()
                 self.resize_start_size = self.size()
                 self.dragging = False
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
             else:
                 self.dragging = True
                 self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
                 self.resizing = False
                 
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton:
-            if self.resizing:
-                self.has_moved = True
-                delta = event.globalPosition().toPoint() - self.resize_start_pos
-                new_width = max(100, self.resize_start_size.width() + delta.x())
-                new_height = max(100, self.resize_start_size.height() + delta.y())
-                self.resize(new_width, new_height)
-            elif self.dragging:
-                # Check if mouse moved significantly (more than 3 pixels)
-                if hasattr(self, 'click_pos'):
-                    move_distance = (event.position().toPoint() - self.click_pos).manhattanLength()
-                    if move_distance > 3:
-                        self.has_moved = True
-                        self.move(event.globalPosition().toPoint() - self.drag_position)
-            
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             # Only trigger toggle if:
             # 1. Mouse hasn't moved significantly during drag
             # 2. Not clicking near resize corner
             # 3. Was not in resize mode
+            # 4. Not clicking skip button area
             should_toggle = (
-                not getattr(self, 'has_moved', True) and  # No significant movement
-                not self.resizing  # Not resizing
+                not getattr(self, 'has_moved', True) and
+                not self.resizing
             )
             
             # Check resize corner
@@ -221,17 +269,25 @@ class FloatingWidget(QWidget):
                               self.height() - event.position().y() < edge_threshold)
                 should_toggle = not near_corner
             
+            # Check skip button area (only during break)
+            if should_toggle and not self.is_working and self.width() > 80:
+                skip_area = QRect(self.width() - 21, 5, 16, 16)
+                should_toggle = not skip_area.contains(event.position().toPoint())
+            
             # Reset flags
             self.dragging = False
             self.resizing = False
             self.has_moved = False
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
             
             # Emit toggle signal only if it's a clean click
             if should_toggle:
                 self.toggle_timer.emit()
         
     def mouseDoubleClickEvent(self, event):
-        """Double click to return to main window"""
+        """Double click to return to main window - don't toggle timer"""
+        # Prevent the single click toggle from happening on double click
+        self.has_moved = True  # Mark as moved to prevent toggle
         self.clicked.emit()
         
     def setValue(self, value):
@@ -433,6 +489,24 @@ class PomodoroTimer(QMainWindow):
         self.reset_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.reset_btn.clicked.connect(self.reset_timer)
         button_layout.addWidget(self.reset_btn)
+        
+        # Skip break button (only visible during break)
+        self.skip_btn = QPushButton("⏭️ Skip Break")
+        self.skip_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.skip_btn.clicked.connect(self.skip_break)
+        self.skip_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF8C00;
+            }
+            QPushButton:hover {
+                background-color: #FF7F00;
+            }
+            QPushButton:pressed {
+                background-color: #FF6500;
+            }
+        """)
+        self.skip_btn.hide()  # Initially hidden
+        button_layout.addWidget(self.skip_btn)
         
         layout.addLayout(button_layout)
         
@@ -671,6 +745,47 @@ class PomodoroTimer(QMainWindow):
         if self.floating_widget:
             self.floating_widget.setRunningState(self.is_running)
         
+        # Update skip button visibility
+        self.update_skip_button_visibility()
+        
+    def skip_break(self):
+        """Skip the current break and start a new work session"""
+        if not self.is_working:  # Only allow skip during break
+            self.timer.stop()
+            self.is_running = False
+            
+            # Switch back to work mode
+            self.is_working = True
+            self.current_time = self.work_time
+            self.progress_widget.setMaxValue(self.work_time)
+            self.progress_widget.setValue(self.work_time)
+            self.progress_widget.setColor(QColor(self.config["work_color"]))
+            
+            if self.floating_widget:
+                self.floating_widget.setMaxValue(self.work_time)
+                self.floating_widget.setValue(self.work_time)
+                self.floating_widget.setColor(QColor(self.config["work_color"]))
+                self.floating_widget.setRunningState(self.is_running)
+                self.floating_widget.setWorkingState(self.is_working)
+                
+            self.status_label.setText("Ready to focus")
+            self.start_btn.setText("▶️ Start")
+            
+            # Update skip button visibility
+            self.update_skip_button_visibility()
+            
+            # Show notification
+            self.tray_icon.showMessage("Pomodoro Timer", "Break skipped! Ready for another work session.", 
+                                       QSystemTrayIcon.MessageIcon.Information, 2000)
+    
+    def update_skip_button_visibility(self):
+        """Update skip button visibility based on current state"""
+        if hasattr(self, 'skip_btn'):
+            if not self.is_working:  # Show during break
+                self.skip_btn.show()
+            else:  # Hide during work
+                self.skip_btn.hide()
+        
     def update_timer(self):
         """Update timer countdown"""
         if self.current_time > 0:
@@ -706,6 +821,7 @@ class PomodoroTimer(QMainWindow):
             if self.floating_widget:
                 self.floating_widget.setMaxValue(self.break_time)
                 self.floating_widget.setColor(QColor(self.config["break_color"]))
+                self.floating_widget.setWorkingState(self.is_working)
                 
             self.status_label.setText("Break time!")
             
@@ -734,6 +850,7 @@ class PomodoroTimer(QMainWindow):
             if self.floating_widget:
                 self.floating_widget.setMaxValue(self.work_time)
                 self.floating_widget.setColor(QColor(self.config["work_color"]))
+                self.floating_widget.setWorkingState(self.is_working)
                 
             self.status_label.setText("Ready to focus")
             self.start_btn.setText("▶️ Start")
@@ -745,6 +862,9 @@ class PomodoroTimer(QMainWindow):
         self.progress_widget.setValue(self.current_time)
         if self.floating_widget:
             self.floating_widget.setValue(self.current_time)
+        
+        # Update skip button visibility
+        self.update_skip_button_visibility()
         
     def reset_timer(self):
         """Reset the timer to initial state"""
@@ -762,22 +882,28 @@ class PomodoroTimer(QMainWindow):
             self.floating_widget.setValue(self.work_time)
             self.floating_widget.setColor(QColor(self.config["work_color"]))
             self.floating_widget.setRunningState(self.is_running)
+            self.floating_widget.setWorkingState(self.is_working)
             
         self.start_btn.setText("▶️ Start")
         self.status_label.setText("Ready to focus")
+        
+        # Update skip button visibility
+        self.update_skip_button_visibility()
         
     def show_floating_widget(self):
         """Show floating widget and hide main window"""
         if not self.floating_widget:
             self.floating_widget = FloatingWidget()
             self.floating_widget.clicked.connect(self.show_main_window)
-            self.floating_widget.toggle_timer.connect(self.toggle_timer)  # Connect the toggle signal
+            self.floating_widget.toggle_timer.connect(self.toggle_timer)
+            self.floating_widget.skip_break.connect(self.skip_break)  # Connect skip signal
             
         self.floating_widget.setMaxValue(self.work_time if self.is_working else self.break_time)
         self.floating_widget.setValue(self.current_time)
         self.floating_widget.setColor(QColor(self.config["work_color"] if self.is_working else self.config["break_color"]))
         self.floating_widget.setFontSize(self.config.get("font_size", 12))
-        self.floating_widget.setRunningState(self.is_running)  # Set the running state
+        self.floating_widget.setRunningState(self.is_running)
+        self.floating_widget.setWorkingState(self.is_working)  # Set work/break state
         self.floating_widget.show()
         
         self.hide()
