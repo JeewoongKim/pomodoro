@@ -612,7 +612,7 @@ class PomodoroTimer(QMainWindow):
         self.dir_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         dir_layout.addWidget(self.dir_label)
         
-        browse_btn = QPushButton("📁 Browse")
+        browse_btn = QPushButton("📂 Browse")
         browse_btn.clicked.connect(self.choose_data_directory)
         browse_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         dir_layout.addWidget(browse_btn)
@@ -648,13 +648,17 @@ class PomodoroTimer(QMainWindow):
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.plot_widget.setBackground('w')
-        self.plot_widget.setTitle("Weekly Focus Time", color='b', size='16pt')
-        self.plot_widget.setLabel('left', 'Minutes', color='b', size='12pt')
+        self.plot_widget.setTitle("Weekly Sessions Count", color='b', size='16pt')
+        self.plot_widget.setLabel('left', 'Sessions', color='b', size='12pt')
         self.plot_widget.setLabel('bottom', 'Day', color='b', size='12pt')
         
-        # Set Y-axis range from 0 to 60 with 5-minute intervals
-        self.plot_widget.setYRange(0, 65)
-        y_ticks = [(i, str(i)) for i in range(0, 65, 5)]
+        # Set fixed Y-axis range and disable auto-scaling to prevent movement
+        self.plot_widget.setYRange(0, 20, padding=0)  # Max 20 sessions per day
+        self.plot_widget.setMouseEnabled(x=False, y=False)  # Disable mouse zoom/pan
+        self.plot_widget.enableAutoRange(False)  # Disable auto-range
+        
+        # Set Y-axis ticks for sessions (0 to 20 with 2-session intervals)
+        y_ticks = [(i, str(i)) for i in range(0, 21, 2)]
         self.plot_widget.getAxis('left').setTicks([y_ticks])
         
         layout.addWidget(self.plot_widget, stretch=1)
@@ -933,7 +937,7 @@ class PomodoroTimer(QMainWindow):
         self.load_weekly_data()
         
     def load_weekly_data(self):
-        """Load weekly focus data for statistics"""
+        """Load weekly session count data for statistics"""
         today = datetime.now()
         week_start = today - timedelta(days=today.weekday())
         
@@ -952,12 +956,12 @@ class PomodoroTimer(QMainWindow):
                         session_date = datetime.strptime(row["Date"], "%Y-%m-%d")
                         if week_start <= session_date <= today:
                             day_name = session_date.strftime("%a")
-                            if day_name in weekly_data:
-                                weekly_data[day_name] += int(row["Duration (minutes)"])
+                            if day_name in weekly_data and row["Type"] == "Work":
+                                weekly_data[day_name] += 1  # Count sessions instead of minutes
                     except (ValueError, KeyError):
                         continue
                             
-        # Update chart
+        # Update chart with fixed parameters
         if hasattr(self, 'plot_widget'):
             self.plot_widget.clear()
             days = list(weekly_data.keys())
@@ -968,6 +972,11 @@ class PomodoroTimer(QMainWindow):
             self.plot_widget.addItem(bargraph)
             
             self.plot_widget.getAxis('bottom').setTicks([[(i, days[i]) for i in range(len(days))]])
+            
+            # Ensure fixed Y-axis range and disable interactions
+            self.plot_widget.setYRange(0, 20, padding=0)
+            self.plot_widget.setMouseEnabled(x=False, y=False)
+            self.plot_widget.enableAutoRange(False)
             
     def choose_color(self, color_type):
         """Open color picker dialog"""
