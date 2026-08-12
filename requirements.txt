@@ -1,0 +1,9 @@
+PySide6>=6.5
+pyqtgraph>=0.13
+Pillow>=10.0
+
+# macOS only: lets the floating widget set a native "always on top"
+# window level so it never has to call raise_()/activate the app to
+# stay visible (avoids stealing focus from other apps). Safe to skip
+# on Windows/Linux — the app falls back gracefully without it.
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
