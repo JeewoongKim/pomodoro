@@ -4,6 +4,30 @@ echo ===============================================
 echo Pomodoro Timer - Final Build with Icon
 echo ===============================================
 
+echo Step 0: Installing dependencies...
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt pyinstaller
+if %errorlevel% neq 0 (
+    echo ERROR: Failed to install dependencies. Check the "python" and
+    echo "pip" commands above point to the same Python you intend to
+    echo build with.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Step 0b: Verifying PySide6 is importable...
+python -c "import PySide6; print('PySide6 OK:', PySide6.__version__)"
+if %errorlevel% neq 0 (
+    echo ERROR: PySide6 did not import correctly even after install.
+    echo This is almost always caused by having more than one Python
+    echo installed and "python"/"pip" pointing to different ones.
+    echo Try: python -m pip install --force-reinstall PySide6
+    pause
+    exit /b 1
+)
+
+echo.
 echo Step 1: Creating icon...
 python create_icon.py
 if %errorlevel% neq 0 (
@@ -11,17 +35,36 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo Step 2: Building with icon...
+echo Step 2: Cleaning previous build artifacts...
+REM Stale build/dist folders from a broken earlier build are a common
+REM cause of a "successful" build that still fails to import PySide6
+REM at runtime, so always start clean.
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
+if exist PomodoroTimer-Final.spec del /q PomodoroTimer-Final.spec
+
+echo.
+echo Step 3: Building with icon...
+REM --collect-all PySide6 is the officially recommended PyInstaller
+REM flag for PySide6 apps: it force-bundles every PySide6 submodule,
+REM Qt plugin, and shared library instead of relying on PyInstaller's
+REM static import analysis, which is what "No module named PySide6"
+REM at runtime usually means went wrong.
+set ICON_ARG=
 if exist pomodoro_icon.ico (
     echo Using custom tomato icon
-    python -m PyInstaller --onefile --windowed --icon=pomodoro_icon.ico --name=PomodoroTimer-Final pomodoro_pyside6.py
+    set ICON_ARG=--icon=pomodoro_icon.ico
 ) else if exist simple_icon.ico (
     echo Using simple icon
-    python -m PyInstaller --onefile --windowed --icon=simple_icon.ico --name=PomodoroTimer-Final pomodoro_pyside6.py
+    set ICON_ARG=--icon=simple_icon.ico
 ) else (
     echo No icon found, building without icon
-    python -m PyInstaller --onefile --windowed --name=PomodoroTimer-Final pomodoro_pyside6.py
 )
+
+python -m PyInstaller --onefile --windowed --clean --noconfirm ^
+    --collect-all PySide6 ^
+    --collect-all shiboken6 ^
+    %ICON_ARG% --name=PomodoroTimer-Final pomodoro_pyside6.py
 
 if %errorlevel% neq 0 (
     echo ERROR: Build failed
@@ -29,8 +72,15 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+if not exist "dist\PomodoroTimer-Final.exe" (
+    echo ERROR: Build reported success but dist\PomodoroTimer-Final.exe
+    echo is missing. Something is wrong with the PyInstaller environment.
+    pause
+    exit /b 1
+)
+
 echo.
-echo Step 3: Creating distribution folder...
+echo Step 4: Creating distribution folder...
 if not exist "PomodoroTimer_Final" mkdir "PomodoroTimer_Final"
 copy "dist\PomodoroTimer-Final.exe" "PomodoroTimer_Final\"
 if exist pomodoro_icon.png copy "pomodoro_icon.png" "PomodoroTimer_Final\"
