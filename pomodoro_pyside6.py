@@ -8,6 +8,7 @@ import sys
 import os
 import json
 import csv
+import platform
 from datetime import datetime, timedelta
 from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -22,6 +23,52 @@ from PySide6.QtGui import (QPainter, QColor, QPen, QBrush, QIcon, QPixmap,
                          QPainterPath, QFont, QAction, QFontMetrics)
 import pyqtgraph as pg
 from typing import Optional, Dict, List, Tuple
+
+
+def get_app_icon_path() -> Optional[str]:
+    """Return the best available app icon path for the current OS.
+
+    macOS prefers .icns, Windows prefers .ico, everything else falls
+    back to the PNG preview generated alongside it. Works both when
+    running from source and when frozen into a PyInstaller bundle.
+    """
+    base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    system = platform.system()
+    if system == "Darwin":
+        candidates = ["pomodoro_icon.icns", "pomodoro_icon.png"]
+    elif system == "Windows":
+        candidates = ["pomodoro_icon.ico", "pomodoro_icon.png"]
+    else:
+        candidates = ["pomodoro_icon.png", "pomodoro_icon.ico"]
+
+    for name in candidates:
+        path = base_dir / name
+        if path.exists():
+            return str(path)
+    return None
+
+
+def _pomodoro_log(message):
+    """Log a message for diagnostics.
+
+    Windowed (no-console) builds swallow print() output entirely, so
+    this also appends to a log file the user can check even when
+    running the packaged .app: ~/Library/Logs/PomodoroTimer.log on
+    macOS, or PomodoroTimer.log next to the config on other platforms.
+    """
+    print(f"[Pomodoro] {message}")
+    try:
+        if platform.system() == "Darwin":
+            log_dir = Path.home() / "Library" / "Logs"
+        else:
+            log_dir = Path.home() / ".pomodoro"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "PomodoroTimer.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+    except Exception:
+        pass  # Logging must never crash the app.
+
 
 class CircularProgress(QWidget):
     """Custom widget for circular progress visualization"""
@@ -97,8 +144,14 @@ class FloatingWidget(QWidget):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | 
                            Qt.WindowType.WindowStaysOnTopHint |
-                           Qt.WindowType.Tool)
+                           Qt.WindowType.Tool |
+                           Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Never take keyboard focus: this widget should float on top
+        # purely visually and must not steal focus from whatever app
+        # the user is actually clicking into (macOS especially).
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setWindowOpacity(0.9)
         
         self.dragging = False
@@ -121,6 +174,142 @@ class FloatingWidget(QWidget):
         
         # Enable mouse tracking for hover effects
         self.setMouseTracking(True)
+
+        # WORKAROUND for a known Qt/macOS quirk: WindowStaysOnTopHint alone
+        # is not always honored once another app's window gains focus, so
+        # the floating widget can silently sink behind it.
+        #
+        # IMPORTANT: on macOS, do NOT fix this by periodically calling
+        # Qt's raise_(). Qt's Cocoa backend activates the whole
+        # application when an always-on-top window is raised, which is
+        # exactly what steals focus from whatever app the user just
+        # clicked into.
+        #
+        # Instead, on macOS we bridge to the real NSWindow (via PyObjC)
+        # once, and periodically call its native orderFrontRegardless(),
+        # which Apple documents as bringing a window to front WITHOUT
+        # making it key and WITHOUT activating the app -- i.e. exactly
+        # "stay visually on top, never steal focus". We also set a high
+        # window level once as a baseline. On non-macOS platforms, plain
+        # Qt raise_() polling is safe and doesn't have this problem.
+        self._stay_on_top_timer = QTimer(self)
+        self._stay_on_top_timer.timeout.connect(self._keep_on_top)
+        self._macos_ns_window = None
+
+    def _keep_on_top(self):
+        """Re-assert always-on-top without stealing keyboard focus."""
+        if not self.isVisible():
+            return
+        if self._macos_ns_window is not None:
+            # Native, non-activating "bring to front". If this ever
+            # fails (e.g. the underlying NSWindow was recreated), drop
+            # the cached reference so the next tick re-bridges instead
+            # of silently doing nothing forever.
+            try:
+                self._macos_ns_window.orderFrontRegardless()
+                # Cheap to reassert every tick in case something else
+                # (another always-on-top app, a Space change, or Qt's
+                # own Cocoa backend) reset the level or hidesOnDeactivate.
+                self._macos_ns_window.setLevel_(25)
+                self._macos_ns_window.setHidesOnDeactivate_(False)
+            except Exception as e:
+                _pomodoro_log(f"orderFrontRegardless failed, re-bridging: {e}")
+                self._macos_ns_window = None
+                self.raise_()
+        elif platform.system() == "Darwin":
+            # Native bridging isn't available (PyObjC missing or the
+            # first bridge attempt failed) -- try again periodically in
+            # case it was a transient issue, and fall back to raise_()
+            # in the meantime.
+            self._macos_ns_window = self._get_macos_ns_window()
+            self.raise_()
+        else:
+            self.raise_()
+
+    def _get_macos_ns_window(self):
+        """Bridge this widget's native NSView -> NSWindow via PyObjC.
+
+        Returns the NSWindow object, or None if PyObjC isn't installed
+        or the bridging fails for any reason (widget still works either
+        way, just without the native focus-safe on-top behavior).
+        """
+        if platform.system() != "Darwin":
+            return None
+        try:
+            import objc
+            from AppKit import (
+                NSWindowCollectionBehaviorCanJoinAllSpaces,
+                NSWindowCollectionBehaviorStationary,
+                NSWindowCollectionBehaviorFullScreenAuxiliary,
+                NSWindowCollectionBehaviorIgnoresCycle,
+            )
+        except ImportError as e:
+            _pomodoro_log(
+                "pyobjc-framework-Cocoa not importable "
+                f"({e}) -- falling back to Qt raise_() for the floating "
+                "widget. If this is a packaged .app, the build likely "
+                "didn't bundle PyObjC; rebuild with the updated build "
+                "script. If running from source: "
+                "pip install pyobjc-framework-Cocoa"
+            )
+            return None
+
+        try:
+            wid = int(self.winId())
+            ns_view = objc.objc_object(c_void_p=wid)
+            ns_window = ns_view.window()
+            if ns_window is None:
+                _pomodoro_log(
+                    f"Could not resolve NSWindow from NSView (winId={wid}) "
+                    "-- falling back to Qt raise_()."
+                )
+                return None
+
+            # kCGStatusWindowLevel (25): sits above normal windows (0),
+            # floating panels (3), utility windows (19), and the Dock
+            # (20), similar to menu-bar-style status items.
+            ns_window.setLevel_(25)
+
+            # THE ACTUAL FIX for "hidden when another app is clicked":
+            # Qt's Tool window type is implemented as an NSPanel on
+            # macOS, and NSPanel defaults to hidesOnDeactivate = YES --
+            # meaning Cocoa auto-hides it the instant this app stops
+            # being the frontmost app, regardless of window level or
+            # ordering. This is separate from (and overrides) anything
+            # setLevel_/orderFrontRegardless can fix. Disabling it is
+            # required for a true always-visible floating widget.
+            ns_window.setHidesOnDeactivate_(False)
+
+            behavior = (
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehaviorFullScreenAuxiliary
+                | NSWindowCollectionBehaviorIgnoresCycle
+            )
+            ns_window.setCollectionBehavior_(behavior)
+            _pomodoro_log("Native macOS always-on-top applied "
+                          "(hidesOnDeactivate disabled).")
+            return ns_window
+        except Exception as e:
+            _pomodoro_log(f"Native macOS always-on-top failed: {e}")
+            return None
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if platform.system() == "Darwin" and self._macos_ns_window is None:
+            self._macos_ns_window = self._get_macos_ns_window()
+        # Always poll: on macOS this uses the native, focus-safe
+        # orderFrontRegardless() when available (see _keep_on_top), and
+        # plain raise_() everywhere else / as a fallback. A short
+        # interval keeps it visually on top reliably even if the OS or
+        # another always-on-top app reorders windows in between ticks.
+        self._keep_on_top()
+        self._stay_on_top_timer.start(500)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+
+        self._stay_on_top_timer.stop()
         
     def setRunningState(self, is_running):
         """Update the running state of the widget"""
@@ -366,6 +555,10 @@ class PomodoroTimer(QMainWindow):
         self.setWindowTitle("Pomodoro Timer (PySide6)")
         self.setMinimumSize(400, 500)
         self.resize(500, 600)
+
+        icon_path = get_app_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
         
         # Apply dynamic font size to main window
         base_font_size = self.config.get("font_size", 12)
@@ -684,12 +877,27 @@ class PomodoroTimer(QMainWindow):
         
     def create_system_tray(self):
         """Create system tray icon"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon = None
+            return
+
         self.tray_icon = QSystemTrayIcon(self)
-        
-        # Create a simple icon
-        pixmap = QPixmap(16, 16)
-        pixmap.fill(QColor(self.config["work_color"]))
-        self.tray_icon.setIcon(QIcon(pixmap))
+
+        # Prefer the real app icon (looks correct in the macOS menu bar
+        # and Windows notification area); fall back to a colored dot.
+        icon_path = get_app_icon_path()
+        if icon_path:
+            self.tray_icon.setIcon(QIcon(icon_path))
+        else:
+            pixmap = QPixmap(22, 22)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setBrush(QColor(self.config["work_color"]))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(2, 2, 18, 18)
+            painter.end()
+            self.tray_icon.setIcon(QIcon(pixmap))
         
         # Tray menu
         tray_menu = QMenu()
@@ -714,7 +922,18 @@ class PomodoroTimer(QMainWindow):
         
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self.tray_icon_activated)
-        
+
+    def notify(self, title, message, timeout=3000):
+        """Show a tray notification if a tray icon is available.
+
+        Some environments (or a user who has hidden the menu bar icon
+        on macOS) may not have a usable tray icon, so this is always
+        safe to call.
+        """
+        if self.tray_icon:
+            self.tray_icon.showMessage(title, message,
+                                       QSystemTrayIcon.MessageIcon.Information, timeout)
+
     def tray_icon_activated(self, reason):
         """Handle tray icon activation"""
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -779,8 +998,7 @@ class PomodoroTimer(QMainWindow):
             self.update_skip_button_visibility()
             
             # Show notification
-            self.tray_icon.showMessage("Pomodoro Timer", "Break skipped! Ready for another work session.", 
-                                       QSystemTrayIcon.MessageIcon.Information, 2000)
+            self.notify("Pomodoro Timer", "Break skipped! Ready for another work session.", 2000)
     
     def update_skip_button_visibility(self):
         """Update skip button visibility based on current state"""
@@ -830,8 +1048,7 @@ class PomodoroTimer(QMainWindow):
             self.status_label.setText("Break time!")
             
             # Show notification
-            self.tray_icon.showMessage("Pomodoro Timer", "Work session completed! Time for a break.", 
-                                       QSystemTrayIcon.MessageIcon.Information, 3000)
+            self.notify("Pomodoro Timer", "Work session completed! Time for a break.", 3000)
             
             # Auto-start break if enabled
             if self.config.get("auto_start_break", True):
@@ -860,8 +1077,7 @@ class PomodoroTimer(QMainWindow):
             self.start_btn.setText("▶️ Start")
             
             # Show notification
-            self.tray_icon.showMessage("Pomodoro Timer", "Break finished! Ready for another session?", 
-                                       QSystemTrayIcon.MessageIcon.Information, 3000)
+            self.notify("Pomodoro Timer", "Break finished! Ready for another session?", 3000)
             
         self.progress_widget.setValue(self.current_time)
         if self.floating_widget:
@@ -911,7 +1127,8 @@ class PomodoroTimer(QMainWindow):
         self.floating_widget.show()
         
         self.hide()
-        self.tray_icon.show()
+        if self.tray_icon:
+            self.tray_icon.show()
         
     def save_session_data(self):
         """Save completed session data"""
@@ -1116,8 +1333,7 @@ class PomodoroTimer(QMainWindow):
         """Handle close event - automatically switch to widget mode"""
         event.ignore()
         self.show_floating_widget()
-        self.tray_icon.showMessage("Pomodoro Timer", "Application minimized to widget mode", 
-                                   QSystemTrayIcon.MessageIcon.Information, 2000)
+        self.notify("Pomodoro Timer", "Application minimized to widget mode", 2000)
     
     def changeEvent(self, event):
         """Handle window state changes"""
@@ -1135,7 +1351,11 @@ def main():
     # Set application name and organization for proper config storage
     app.setApplicationName("PomodoroTimer")
     app.setOrganizationName("PomodoroApps")
-    
+
+    icon_path = get_app_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
+
     # Prevent app from quitting when last window is closed (for tray icon)
     app.setQuitOnLastWindowClosed(False)
     
